@@ -249,11 +249,11 @@ learn-claude-code/
 ```env
 # LLM (Anthropic-compatible API)
 ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
-ANTHROPIC_API_KEY=sk-0916fa48ec974116a5e4a134630f935a
+ANTHROPIC_API_KEY=sk-your-deepseek-key
 MODEL_ID=deepseek-v4-pro
 
 # Embedding (百炼)
-DASHSCOPE_API_KEY=sk-9eaa32e4b5df48b3b9ba547bd3fb4b0c
+DASHSCOPE_API_KEY=sk-your-bailian-key
 ```
 
 ## 实测数据
