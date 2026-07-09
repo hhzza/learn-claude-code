@@ -585,17 +585,140 @@ def run_cancel_cron(job_id: str) -> str:
 
 
 # ── MessageBus (s15 new) ──
-# Teaching version uses simple file append + unlink.
-# Real CC uses proper-lockfile for concurrent write safety.
+# Uses proper-lockfile pattern: each inbox gets a .lock file storing PID+hostname.
+# Stale locks (dead PID) are automatically broken.
+# Max 10 retries per acquire, then raises LockTimeoutError.
 
 MAILBOX_DIR = WORKDIR / ".mailboxes"
 MAILBOX_DIR.mkdir(exist_ok=True)
 
 
+class LockTimeoutError(Exception):
+    """Raised when lock acquisition exceeds max retries."""
+    pass
+
+
+class FileLock:
+    """Process-level file mutex with deadlock detection.
+
+    Creates a .lock file adjacent to the target, recording the holder's PID
+    and hostname.  If the holder process has died (PID not alive), the lock
+    is treated as stale and can be stolen by the next waiter.
+
+    Usage:
+        lock = FileLock(path)
+        lock.acquire()
+        try:
+            ...  # critical section
+        finally:
+            lock.release()
+    """
+
+    def __init__(self, target: Path):
+        self._target = target
+        self._lock_path = target.parent / f"{target.name}.lock"
+        self._held = False
+
+    # ── public API ──
+
+    def acquire(self, timeout_per_attempt: float = 0.1,
+                max_retries: int = 10) -> bool:
+        """Try to acquire the lock, retrying up to *max_retries* times.
+
+        Returns True on success.  Raises LockTimeoutError if all retries
+        are exhausted.
+        """
+        for attempt in range(max_retries):
+            if self._try_acquire():
+                self._held = True
+                return True
+            time.sleep(timeout_per_attempt)
+        raise LockTimeoutError(
+            f"Failed to acquire lock on {self._target} "
+            f"after {max_retries} retries"
+        )
+
+    def release(self):
+        """Release the lock. Safe to call even if not held."""
+        if not self._held:
+            return
+        try:
+            self._lock_path.unlink(missing_ok=True)
+        finally:
+            self._held = False
+
+    # ── internals ──
+
+    def _try_acquire(self) -> bool:
+        """Single attempt. Returns True if lock was obtained.
+
+        Uses open(…, 'x') — exclusive create — so the OS guarantees that
+        only one caller can create the file.  A pre-existing file means
+        another process already holds the lock.
+        """
+        try:
+            with open(self._lock_path, 'x') as f:
+                f.write(f"PID: {os.getpid()}\n"
+                        f"Hostname: {os.uname().nodename}\n")
+            return True
+        except FileExistsError:
+            return self._break_if_stale()
+
+    def _break_if_stale(self) -> bool:
+        """If the current holder is dead, steal the lock."""
+        try:
+            content = self._lock_path.read_text()
+        except OSError:
+            return False
+
+        # Parse PID from lock file
+        for line in content.splitlines():
+            if line.startswith("PID:"):
+                try:
+                    pid = int(line.split(":")[1].strip())
+                except (ValueError, IndexError):
+                    return False
+                break
+        else:
+            return False
+
+        if not _pid_alive(pid):
+            # Stale lock — break it and try again
+            self._lock_path.unlink(missing_ok=True)
+            return self._try_acquire()
+
+        return False  # holder is alive → wait
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *args):
+        self.release()
+
+
+def _pid_alive(pid: int) -> bool:
+    """Check whether a process with the given PID exists on this machine."""
+    try:
+        os.kill(pid, 0)  # signal 0 = existence check, no signal sent
+        return True
+    except (OSError, PermissionError):
+        # PermissionError means the PID exists but belongs to another user
+        return True
+    except ProcessLookupError:
+        return False
+
+
 class MessageBus:
-    """File-based message bus. Each agent has a .jsonl inbox.
-    Read is destructive: read_text + unlink (consumes messages).
-    Teaching version: no file locking; real CC uses proper-lockfile."""
+    """File-based message bus with proper-lockfile concurrency control.
+
+    Each agent gets a .jsonl inbox under .mailboxes/.  A companion .lock file
+    gates all read/write operations so that multiple Agent threads writing to
+    the same inbox do not interleave or clobber each other's data.
+
+    Reads are destructive: the entire inbox is read, parsed, and then the
+    file is unlinked (consumed).  The lock makes this read+unlink atomic.
+    """
 
     def send(self, from_agent: str, to_agent: str, content: str,
              msg_type: str = "message"):
@@ -603,8 +726,13 @@ class MessageBus:
                "content": content, "type": msg_type,
                "ts": time.time()}
         inbox = MAILBOX_DIR / f"{to_agent}.jsonl"
-        with open(inbox, "a") as f:
-            f.write(json.dumps(msg) + "\n")
+        lock = FileLock(inbox)
+        lock.acquire()
+        try:
+            with open(inbox, "a") as f:
+                f.write(json.dumps(msg) + "\n")
+        finally:
+            lock.release()
         print(f"  \033[33m[bus] {from_agent} → {to_agent}: "
               f"{content[:50]}\033[0m")
 
@@ -612,9 +740,18 @@ class MessageBus:
         inbox = MAILBOX_DIR / f"{agent}.jsonl"
         if not inbox.exists():
             return []
-        msgs = [json.loads(line) for line in inbox.read_text().splitlines()
-                if line.strip()]
-        inbox.unlink()  # consume: read + delete
+        lock = FileLock(inbox)
+        lock.acquire()
+        try:
+            # Re-check — another thread may have consumed it between exists()
+            # and acquire().
+            if not inbox.exists():
+                return []
+            msgs = [json.loads(line) for line
+                    in inbox.read_text().splitlines() if line.strip()]
+            inbox.unlink()  # destructive read
+        finally:
+            lock.release()
         return msgs
 
 
